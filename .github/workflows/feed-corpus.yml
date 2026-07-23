@@ -1,0 +1,89 @@
+name: Build feed corpus
+
+# Rebuilds the per-country feed search corpora (feed/{CC}.json.gz in R2) that
+# power GET /feed/search — the "My feed" keyword page (issue #168). Reads each
+# company's FULL, untruncated job text via GET /jobs/{company}?full=1 (authed
+# with the same x-ingest-key as /ingest — #226), PAGED (`page`/`limit`, walked
+# by build_feed_corpus.py), then uploads through the Worker's POST
+# /feed/corpus/{CC}. TEXT_CAP itself is unchanged from before #226 (see that
+# file's docstring: a bigger cap risks OOMing the Worker's 128 MB isolate
+# limit in GET /feed/search, which parses a whole country corpus into memory
+# per cache miss) — reading real text here only fixes the "... [truncated]"
+# marker getting indexed as a false-positive match, it doesn't grow the
+# corpus.
+#
+# Runs every 3 days (was nightly) after the early-morning scrape window, on
+# demand, and whenever the builder itself changes on main (which also
+# bootstraps a fresh corpus right after the feature first merges).
+#
+# Cadence change (2026-07-23, CI billing-wall pass): the directory-first
+# pivot (issue/PR #201, 2026-07-08) demoted "My feed" from primary feature to
+# secondary/beta -- the directory of company career pages is the primary
+# surface now. Nothing hard-depends on sub-24h corpus freshness: the Worker
+# (worker/src/index.ts) and build_feed_corpus.py both already treat a stale
+# corpus as an accepted, named tradeoff rather than an error -- see
+# "over-inclusion for a day beats hiding jobs until the nightly corpus
+# rebuild lands" and "Freshness of a merged feed is only as recent as its
+# stalest corpus" in index.ts -- and the frontend doesn't surface `built_at`
+# to users at all, so there's no UI promise of same-day freshness to break.
+# ROADMAP.md's Phase 1 success test ("open the feed 4-5 days in a row") is
+# about session cadence, not corpus-rebuild cadence. Trading a few extra
+# days of staleness on newly-scraped jobs showing up in feed *search*
+# (title/description matching only -- the directory and per-company listing
+# pages are unaffected, they read D1/R2 directly, not this corpus) buys real
+# headroom against the 2,000 min/month free-tier cap this workflow was
+# contributing ~411 min/month toward (~13.7 min/run x ~30 runs/month,
+# nightly). At every 3 days that becomes ~13.7 min/run x ~10 runs/month =
+# ~137 min/month, a ~274 min/month saving. (Cron day-of-month `*/3` isn't
+# perfectly evenly spaced across a month boundary -- e.g. day 31 then day 1
+# lands one day apart, not three -- harmless here since this only ever makes
+# the corpus fresher than scheduled, never staler.)
+#
+# Repo split (2026-07-23, billing-wall pass part 2): this scheduled trigger
+# now lives in the public morriswong/jtbf-scrape-runner repo instead of the
+# private morriswong/jtbf repo, because standard GitHub-hosted Actions
+# runners are free and unmetered on public repos -- private repos are capped
+# (~2,000 min/month) and that cap is what caused the billing wall in the
+# first place. morriswong/jtbf itself stays private (its scraper source and
+# per-company ATS techniques aren't meant to be public); this repo checks it
+# out at run time via a deploy key (secrets.JTBF_DEPLOY_KEY, read-write,
+# scoped to only that repo) and runs the exact same build step unchanged.
+# The private repo's own feed-corpus.yml keeps its workflow_dispatch and
+# push-on-builder-change triggers for manual/dev use -- only the recurring
+# cron moved here.
+#
+# timeout-minutes stays bumped 30->45 (from an earlier pass at #226): pages
+# through ?full=1 fetch every job's real JD length from the API even though
+# TEXT_CAP caps what ends up IN the corpus, so total bytes transferred by
+# this workflow are still well above the old (already-1000-char-capped)
+# unpaged reads -- just spread across more, smaller requests per large
+# company instead of one big one.
+
+on:
+  schedule:
+    - cron: "45 5 */3 * *"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout private pipeline repo (morriswong/jtbf)
+        uses: actions/checkout@v4
+        with:
+          repository: morriswong/jtbf
+          ssh-key: ${{ secrets.JTBF_DEPLOY_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Build and upload corpora
+        run: python pipeline/build_feed_corpus.py
+        env:
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}

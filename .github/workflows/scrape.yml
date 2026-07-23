@@ -1,0 +1,243 @@
+name: Scrape
+
+# This workflow lives in the PUBLIC jtbf-scrape-runner repo specifically so its
+# scheduled runs are unmetered — standard GitHub-hosted runners are free and
+# unlimited on public repos, whereas morriswong/jtbf (private) has a ~2,000
+# Actions-minute/month cap that this recurring cron chronically exceeded
+# (2026-07-23 billing-wall incident). The actual scraper source (per-company
+# ATS endpoints, bot-detection bypass techniques in scrapers/*/scraper.py) is
+# NOT meant to be public, so it stays in the private jtbf repo and is checked
+# out here at run time via a repo-scoped deploy key — nothing about it is
+# committed to this repo. morriswong/jtbf's own scrape.yml keeps its
+# `workflow_dispatch` (manual runs) and `push`-on-scraper-change (instant
+# refresh after editing a scraper) triggers; only the recurring `schedule`
+# moved here — this file's cron is the direct replacement for what used to be
+# jtbf's own schedule block.
+#
+# One engine, many selectors (issue #160). Every trigger resolves a *set of
+# companies* via select_targets.py, then runs the same scrape -> push engine on
+# exactly that set:
+#   - schedule          -> `all` once to seed, then `stale failed --cap 25`
+#                          (periodic self-healing refresh + failure retry)
+#   - workflow_dispatch -> the `targets` input (a manual button: names or a
+#                          keyword like all / failed / stale)
+on:
+  schedule:
+    # Every 4 hours (6 runs/day, 180/month): refresh up to 25 companies per
+    # run — the stalest plus any that failed to scrape or push last run.
+    # ~150/day covers the ~266-company corpus (data/index.json) daily with
+    # headroom. Widened from */3 (8 runs/day) to */4 to cut GitHub Actions
+    # minutes: at the measured ~4.2 min/run average (from `gh api` run
+    # history over the trailing 30 days, not a guess), 240 runs/month * 4.2
+    # ~= 1,008 min/month at */3 vs. 180 runs/month * 4.2 ~= 756 min/month at
+    # */4 — roughly 250 min/month saved, on top of whatever the conditional
+    # Playwright install below saves. Replaces the old all-at-once daily
+    # monolith. (Now free either way, since this repo is public — kept
+    # anyway: fewer, larger runs still beat more, smaller ones on overhead.)
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Company names (space-separated) or a keyword: all, failed, stale"
+        required: false
+        default: "all"
+
+# Serialize runs so overlapping triggers can't launch duplicate sweeps or race
+# on the committed data/index.json (issue #160 observed a manual + scheduled run
+# colliding). A new run waits for the in-flight one instead of cancelling it.
+concurrency:
+  group: scrape
+  cancel-in-progress: false
+
+permissions:
+  issues: write    # open/close broken-links issue (on THIS repo — see below)
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout private pipeline repo (morriswong/jtbf)
+        uses: actions/checkout@v4
+        with:
+          repository: morriswong/jtbf
+          ssh-key: ${{ secrets.JTBF_DEPLOY_KEY }}
+          # Full history so the `changed` selector (unused by this repo's
+          # triggers, but kept for parity with the private repo's own
+          # scrape.yml) can diff against the pre-push commit.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Resolve targets
+        id: resolve
+        env:
+          # User/event-controlled values via env (never interpolated into the
+          # shell) to avoid script injection.
+          DISPATCH_TARGETS: ${{ github.event.inputs.targets }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            schedule)
+              # Bootstrap: until any company has been scraped, do one full sweep
+              # to seed data/index.json in a single run (self-seeding — no manual
+              # step, no ~7-run wait). After that, small capped runs that refresh
+              # the stalest companies AND retry last run's failures (scrape- or
+              # push-failures), so the periodic run self-heals every cycle.
+              SCRAPED=$(python -c "import json; d=json.load(open('data/index.json')); print(sum(1 for c in d.get('companies',[]) if c.get('scraped_at')))" 2>/dev/null || echo 0)
+              if [ "${SCRAPED:-0}" -eq 0 ]; then
+                ARGS="all"
+              else
+                # Separate budgets so a backlog of failures can't starve the
+                # staleness refresh (and vice-versa): retry up to 10 failures
+                # and refresh up to 15 stalest. The final resolve below
+                # de-dupes and validates the union (<=25 companies).
+                FAILED="$(python pipeline/select_targets.py failed --cap 10)"
+                STALE="$(python pipeline/select_targets.py stale --cap 15)"
+                ARGS="$FAILED $STALE"
+              fi
+              ;;
+            push)
+              BASE="$EVENT_BEFORE"
+              # First push / force-push reports an all-zero before-sha; fall
+              # back to the parent commit.
+              if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+                BASE="HEAD~1"
+              fi
+              ARGS="changed --base $BASE"
+              ;;
+            workflow_dispatch)
+              ARGS="${DISPATCH_TARGETS:-all}"
+              ;;
+            *)
+              ARGS="stale --cap 25"
+              ;;
+          esac
+          echo "Resolving selector: $ARGS"
+          TARGETS="$(python pipeline/select_targets.py $ARGS)"
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          if [ -z "$TARGETS" ]; then
+            echo "No targets resolved — nothing to scrape this run."
+          else
+            echo "Scraping: $TARGETS"
+          fi
+
+          # Only a handful of scrapers need a real browser (currently
+          # citadel, citadelsecurities, federatedhermes, revolut — grep-
+          # confirmed, not hardcoded: `grep -l playwright scrapers/*/scraper.py`).
+          # Installing Chromium (--with-deps) on every run wastes ~20-40s even
+          # when none of this run's resolved targets need it, which is most
+          # runs. Same pattern as .github/workflows/pr-check.yml.
+          NEEDS_PLAYWRIGHT=false
+          for c in $TARGETS; do
+            if grep -ql "playwright" "scrapers/$c/scraper.py" 2>/dev/null; then
+              NEEDS_PLAYWRIGHT=true
+            fi
+          done
+          echo "needs_playwright=$NEEDS_PLAYWRIGHT" >> "$GITHUB_OUTPUT"
+
+      - name: Install Playwright (only if a resolved target actually imports it)
+        if: steps.resolve.outputs.needs_playwright == 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Scrape
+        if: steps.resolve.outputs.targets != ''
+        env:
+          TARGETS: ${{ steps.resolve.outputs.targets }}
+        run: python pipeline/scrape_all.py --no-details $TARGETS
+
+      - name: Push results to the API
+        if: steps.resolve.outputs.targets != ''
+        env:
+          # Set in this repo: Settings > Secrets and variables > Actions.
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          TARGETS: ${{ steps.resolve.outputs.targets }}
+        run: python pipeline/push_to_api.py $TARGETS
+
+      - name: Check links
+        id: link-check
+        if: steps.resolve.outputs.targets != ''
+        continue-on-error: true
+        env:
+          TARGETS: ${{ steps.resolve.outputs.targets }}
+        # Check only the companies scraped this run; over a day the periodic
+        # runs rotate through the whole corpus.
+        run: python pipeline/check_links.py $TARGETS 2>&1 | tee /tmp/link_check.txt; exit ${PIPESTATUS[0]}
+
+      # NOTE: broken-link alerts open as Issues on THIS repo
+      # (morriswong/jtbf-scrape-runner), not on the private morriswong/jtbf
+      # repo — GITHUB_TOKEN here is scoped only to this repo and has no access
+      # to jtbf's issue tracker, so every gh issue call below passes an
+      # explicit --repo to target this repo rather than relying on
+      # auto-detection from the checked-out jtbf git remote.
+      - name: Open GitHub Issue on broken links
+        if: steps.link-check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="$(cat /tmp/link_check.txt)"
+          DATE=$(date -u +"%Y-%m-%d")
+          EXISTING=$(gh issue list --repo morriswong/jtbf-scrape-runner --label broken-links --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo morriswong/jtbf-scrape-runner --body "**Re-checked $DATE — still broken**
+          \`\`\`
+          $BODY
+          \`\`\`"
+          else
+            gh issue create \
+              --repo morriswong/jtbf-scrape-runner \
+              --title "🔗 Broken job links detected ($DATE)" \
+              --label broken-links \
+              --body "The link check found companies with systematically broken job links (≥60% of sampled URLs failing).
+
+          \`\`\`
+          $BODY
+          \`\`\`
+
+          _Auto-opened by the scrape workflow. Auto-closes after a full run (dispatch \`all\`) passes._"
+          fi
+
+      # Only a full sweep can conclude the whole corpus is healthy, so close the
+      # issue solely after a manual `all` run passes — a partial `stale` run only
+      # sampled ~20 companies and must not clear an alarm about the others.
+      - name: Close broken-links issue after a clean full run
+        if: steps.link-check.outcome == 'success' && github.event_name == 'workflow_dispatch' && github.event.inputs.targets == 'all'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list --repo morriswong/jtbf-scrape-runner --label broken-links --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --repo morriswong/jtbf-scrape-runner --comment "A full scrape passed all link checks again. Auto-closing."
+          fi
+
+      # Persist selector state: data/index.json carries who's stale / who failed
+      # so the next run's `stale`/`failed` selectors can read it. Also refreshes
+      # the keepalive timestamp (GitHub disables schedules after 60 idle days).
+      # Runs even when the push step failed (via !cancelled()) — a run with a
+      # push failure is exactly the run that recorded pushed:false, and that
+      # state MUST be committed for the `failed` selector to retry it next
+      # cycle. The job still ends red (the failed push step sets its status),
+      # so the failure signal is preserved. Pushes back to jtbf over SSH using
+      # the deploy key the checkout step above configured — no extra auth
+      # needed here.
+      - name: Commit selector state + keepalive
+        if: ${{ !cancelled() && steps.resolve.outputs.targets != '' }}
+        run: |
+          mkdir -p .github
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/last_run.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/index.json .github/last_run.txt
+          git commit -m "chore: scrape state + keepalive [skip ci]" || { echo "no change to commit"; exit 0; }
+          # Rebase on any commit that landed while we ran, then push.
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push

@@ -1,0 +1,497 @@
+name: Description delta
+
+# Issue #203, generalized into a budgeted backlog drainer by #223. The 3-hourly
+# Scrape workflow runs `scrape_all.py --no-details`, so for every
+# DESCRIPTION_MAP company whose enrich_kwarg gates a real per-job detail fetch,
+# that fetch never runs on the cron — any job posted AFTER the one-time
+# backfill sits with description=null forever. This job fixes that by
+# detail-fetching undescribed jobs (a per-company diff against the live read
+# API), then pushing just their descriptions (upsert + content, never
+# finalize — the Scrape workflow owns the listing lifecycle).
+#
+# Budget (free tier = 2,000 Actions-min/month), re-derived for #223:
+#   - Naive "re-detail every gated company daily" would cost ~8,300 min/month.
+#   - This job LISTING-scrapes the ~67 companies (69 gated minus citadel/
+#     citadelsecurities, see BROWSER_REQUIRED in daily_delta.py) that expose a
+#     per-job seam or are small enough to fully re-enrich (the ~28 large
+#     seam-less ones are skipped with a warning, not scraped), then
+#     detail-fetches only the undescribed jobs each has, under an explicit
+#     fair-share budget (daily_delta.py's water_fill()) instead of
+#     first-come-first-served.
+#   - #223 day-batches the 8 biggest ("seam") boards into two halves (see
+#     SEAM_DAY_BATCH in daily_delta.py) so only ~4 of them listing-scrape +
+#     detail-fetch on any given run (measured: listing all 8 = 6m08s, so half
+#     is ~3m04s), which is what lets timeout-minutes come back down to 30
+#     below (see the arithmetic in the #223 PR body: baseline ~21.9 min
+#     [external_path + small_fallback] + ~3.1 min [half the seam listings] +
+#     ~2.5 min [the day's slowest WAF-throttled company's fair-share detail
+#     fetch, hsbc or morganstanley at seam.delay=1.0s x ~150 allocated jobs,
+#     bounded by parallelism not summed] ≈ 27 min, with ~3 min of headroom).
+#   - 1 run/day => well under 900 min/month even at the ceiling. The 3-hourly
+#     scrape (~1,030/month) and feed-corpus (~130) take most of the rest, so
+#     the headroom is thin: do not raise this again without re-checking the
+#     total.
+#   - No Playwright install: revolut is large + seam-less (skip_large) so it
+#     never calls scrape() here; citadel/citadelsecurities DO need a real
+#     browser even just to list (the whole site sits behind Cloudflare, not
+#     just detail pages) and are explicitly excluded from the default run
+#     (daily_delta.py's BROWSER_REQUIRED) rather than paying for a Chromium
+#     install to enrich a combined 118-job backlog — see that constant's
+#     comment for the reasoning and the manual-backfill alternative.
+#
+# CI-billing-wall pass (2026-07-23): this file's recurring daily schedule (and
+# the coverage-alert job below, which shares the same trigger) now lives here,
+# in the public morriswong/jtbf-scrape-runner repo, instead of in the private
+# morriswong/jtbf repo. Public repos get free, unmetered GitHub Actions
+# minutes on standard runners; private repos are capped (~2,000 min/month),
+# which this job's own cost was already eating a real share of. The actual
+# pipeline source (pipeline/daily_delta.py, data/delta_state.json) stays in
+# the private jtbf repo — every job here checks it out via a repo-scoped
+# deploy key (secrets.JTBF_DEPLOY_KEY, write access only, cannot touch any
+# other repo) rather than copying any code here. jtbf's own
+# description-delta.yml keeps only its workflow_dispatch trigger, for manual
+# one-off drains run directly against the private repo.
+
+on:
+  schedule:
+    # Once a day, offset from the 3-hourly Scrape cron so they don't collide.
+    - cron: "40 5 * * *"
+  workflow_dispatch:
+    inputs:
+      companies:
+        description: "Gated company names (space-separated), or blank for all"
+        required: false
+        default: ""
+      push:
+        description: "Push descriptions to the API (false = dry-run only)"
+        type: boolean
+        required: false
+        default: true
+      global_cap:
+        description: "Total detail fetches for the run (blank = the scheduled default, 1200)"
+        required: false
+        default: ""
+      company_cap:
+        description: "Per-company detail-fetch cap (blank = the scheduled default, 400)"
+        required: false
+        default: ""
+      timeout:
+        description: "Job timeout in minutes (blank = 45). Raise ONLY for a deliberate one-off drain."
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # commit data/delta_state.json (attempt-tracking/parking state, #223)
+
+jobs:
+  description-delta:
+    runs-on: ubuntu-latest
+    # #238 raised this to 45 as a STOPGAP when #237 put the 8 biggest boards in
+    # scope (listing all 8 alone measured 6m08s). #223 day-batches those 8 into
+    # two halves of ~4 (see SEAM_DAY_BATCH in daily_delta.py) so only half their
+    # listing + detail-fetch cost lands in any one run.
+    #
+    # STAYING AT 45, deliberately -- #238 said "come back down to 30" and that was
+    # wrong, for two reasons:
+    #
+    # 1. Actions bills ACTUAL execution minutes, not this number. timeout-minutes is
+    #    a kill switch, not a budget. A 45-min limit on a 25-min run costs exactly the
+    #    same as a 30-min limit on a 25-min run: 25 minutes. Lowering it saves nothing.
+    #    What actually saves money is day-batching (which #223 does) -- that cuts the
+    #    real runtime. The two knobs were conflated; they are unrelated.
+    # 2. The projected fit is ~27.5 min, i.e. 2.5 min under a 30-min limit -- and the
+    #    measured run-to-run spread of this job is 7.3 / 8.9 / 11.8 / 21.5 / 21.9 min.
+    #    A 2.5-min margin against ~3x variance is not a margin. And a timeout here is a
+    #    HARD CANCEL: the run goes red and every company the pool hadn't reached is
+    #    skipped, so one unlucky night costs a whole day of backlog drain.
+    #
+    # 45 caps a genuinely hung run while leaving the normal case room to breathe. Revisit
+    # only with measured runtimes from real CI runs, not projections.
+    #
+    # The `timeout` dispatch input overrides this for a deliberate one-off backlog drain
+    # (a drain fetches thousands of jobs, not a day's handful). Scheduled runs always get 45.
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout || '45') }}
+    steps:
+      - name: Checkout private pipeline repo (morriswong/jtbf)
+        uses: actions/checkout@v4
+        with:
+          repository: morriswong/jtbf
+          ssh-key: ${{ secrets.JTBF_DEPLOY_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Detail-fetch new jobs and push descriptions
+        env:
+          # Shared write key — Settings > Secrets and variables > Actions.
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          # User/event-controlled input via env (never interpolated into the
+          # shell) to avoid script injection.
+          COMPANIES: ${{ github.event.inputs.companies }}
+          GLOBAL_CAP: ${{ github.event.inputs.global_cap }}
+          COMPANY_CAP: ${{ github.event.inputs.company_cap }}
+        run: |
+          set -euo pipefail
+          # scheduled runs always push; manual runs honour the push toggle.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.push }}" = "false" ]; then
+            MODE="--dry-run"
+          else
+            MODE="--push"
+          fi
+          # Cap overrides exist for a deliberate one-off backlog drain. Digits only:
+          # these reach a command line, and COMPANIES/*_CAP are user-controlled input.
+          CAPS=""
+          if [ -n "${GLOBAL_CAP:-}" ]; then
+            case "$GLOBAL_CAP" in (*[!0-9]*|'') echo "global_cap must be digits only"; exit 1;; esac
+            CAPS="$CAPS --global-cap=$GLOBAL_CAP"
+          fi
+          if [ -n "${COMPANY_CAP:-}" ]; then
+            case "$COMPANY_CAP" in (*[!0-9]*|'') echo "company_cap must be digits only"; exit 1;; esac
+            CAPS="$CAPS --company-cap=$COMPANY_CAP"
+          fi
+
+          echo "Running daily_delta.py $MODE$CAPS ${COMPANIES:-<all gated>}"
+          python pipeline/daily_delta.py $MODE $CAPS $COMPANIES
+
+      # Persist attempt-tracking/parking state (#223): data/delta_state.json
+      # records per-job failure streaks so a structurally-unobtainable job
+      # stops being retried daily after PARK_THRESHOLD (3) failures, and stays
+      # parked across runs. Same pattern as scrape.yml's data/index.json
+      # commit. Runs even if the push step failed (!cancelled()) so a
+      # dry-run's "nothing to commit" doesn't need special-casing, and a
+      # partially-failed push run still saves whatever state it produced.
+      - name: Commit delta state
+        if: ${{ !cancelled() }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ ! -f data/delta_state.json ]; then
+            echo "no data/delta_state.json this run (dry-run mode never writes it)"
+            exit 0
+          fi
+          git add data/delta_state.json
+          git commit -m "chore: description-delta attempt state [skip ci]" || { echo "no change to commit"; exit 0; }
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push
+
+  # Issue #225 (WS-6): coverage as a queryable metric + regression alert.
+  # Independent of the delta job above -- it only READS the public /companies
+  # endpoint (no INGEST_SECRET, no /ingest call, ever) and opens/closes a
+  # GitHub Issue the same way the Scrape workflow's broken-links alarm does
+  # (see .github/workflows/scrape.yml). Board + per-company "described" counts
+  # now come from D1's has_description flag (worker/src/index.ts), so this is
+  # one cheap GET instead of the 85k-row crawl description_coverage.py used to
+  # need.
+  #
+  # Deliberately kept inline here rather than as a new tracked .py file: this
+  # issue's file scope is worker/src/index.ts, worker/schema.sql, and this
+  # workflow, and description_coverage.py / backfill_descriptions.py /
+  # push_to_api.py are owned by other in-flight work. The EXCLUDED set below
+  # duplicates backfill_descriptions.py's NEEDS_NEW_SCRAPER_CODE +
+  # NEEDS_JOB_DETAIL_FETCH lists (the WS-5 "not yet drained" exclusions) as a
+  # snapshot -- keep it in sync by hand if those lists change; see the step's
+  # comment for the exact snapshot date.
+  #
+  # CI-billing-wall pass (2026-07-23): this job now runs in the public
+  # morriswong/jtbf-scrape-runner repo (it shares description-delta's
+  # schedule trigger, so it moved along with it). Its GITHUB_TOKEN is scoped
+  # to THIS repo, not morriswong/jtbf, so coverage-regression alerts now open
+  # as Issues on jtbf-scrape-runner (--repo flag added below on every gh
+  # call) rather than on the private jtbf repo.
+  coverage-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # commit .github/coverage_history.json (the WoW baseline)
+      issues: write      # open/comment/close the coverage-regression issue
+    steps:
+      - name: Checkout private pipeline repo (morriswong/jtbf)
+        uses: actions/checkout@v4
+        with:
+          repository: morriswong/jtbf
+          ssh-key: ${{ secrets.JTBF_DEPLOY_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure the coverage-regression label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create coverage-regression \
+            --repo morriswong/jtbf-scrape-runner \
+            --color "B60205" \
+            --description "Opened by the coverage-alert job (#225) on a description-coverage regression" \
+            2>/dev/null || true
+
+      # Kept inline (not a checked-in .py file) -- see the job comment above
+      # for why. Reads the public GET /companies (no INGEST_SECRET, never a
+      # write); prints a human report (tee'd for the issue body below); exits
+      # 0 clean / 1 real regression / 2 infra failure (couldn't fetch
+      # /companies at all -- the read API is documented to shed load, see
+      # docs/description-system.md's Traps section) -- these three are NOT
+      # conflated below: an infra blip must neither open a false alarm NOR
+      # auto-close a real one. Always writes .github/coverage_history.json
+      # so tomorrow's run has a baseline, even when today's check found a
+      # regression (it does NOT write the file on an infra failure, since
+      # there's nothing genuine to record).
+      - name: Compute coverage and check for regression
+        id: coverage-check
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python3.12 - <<'PY' 2>&1 | tee /tmp/coverage_check.txt
+          import json
+          import os
+          import sys
+          import time
+          import urllib.request
+          import urllib.error
+          import datetime
+
+          API = os.environ.get("API_URL", "https://jtbf-jobs-api.morriswch.workers.dev").rstrip("/")
+          HISTORY_PATH = ".github/coverage_history.json"
+          TODAY = datetime.date.today().isoformat()
+          HISTORY_MAX_DAYS = 90
+
+          # Companies parked as "not yet drained" (WS-5's exclusion lists --
+          # NEEDS_NEW_SCRAPER_CODE + NEEDS_JOB_DETAIL_FETCH in
+          # backfill_descriptions.py, snapshotted 2026-07-13, see
+          # docs/description-system.md). Duplicated here rather than imported
+          # -- see this job's leading comment for why -- so keep in sync by
+          # hand if those lists change.
+          EXCLUDED = {
+              "airwallex", "balyasny", "bcg", "deloitte", "standard_chartered", "ubs",
+              "etoro", "fenergo", "rippling", "root", "zego",
+          }
+
+          BOARD_DROP_THRESHOLD = 2.0        # percentage points, week-over-week
+          COMPANY_FULL_THRESHOLD = 95.0      # a company counts as "previously full" at/above this %
+          COMPANY_REGRESSED_THRESHOLD = 80.0  # ...and "regressed" if it falls below this %
+
+
+          def fetch_companies() -> dict:
+              req = urllib.request.Request(f"{API}/companies", headers={"user-agent": "jtbf-coverage-alert/1.0"})
+              last_err = None
+              for attempt in range(5):
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          return json.load(r)
+                  except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      last_err = exc
+                      time.sleep(min(20, 2.0 * (2 ** attempt)))
+              print(f"ERROR: could not fetch {API}/companies after retries: {last_err}")
+              sys.exit(2)  # infra failure, distinct from a real regression (exit 1)
+
+
+          def pct(described: int, open_: int):
+              return round(100.0 * described / open_, 1) if open_ > 0 else None
+
+
+          def load_history() -> list:
+              if not os.path.isfile(HISTORY_PATH):
+                  return []
+              try:
+                  with open(HISTORY_PATH) as f:
+                      return json.load(f)
+              except (json.JSONDecodeError, OSError) as exc:
+                  print(f"WARNING: could not read {HISTORY_PATH} ({exc}); starting fresh history")
+                  return []
+
+
+          def save_history(history: list) -> None:
+              os.makedirs(os.path.dirname(HISTORY_PATH) or ".", exist_ok=True)
+              with open(HISTORY_PATH, "w") as f:
+                  json.dump(history, f, indent=2, sort_keys=True)
+                  f.write("\n")
+
+
+          def find_entry(history: list, *, days_ago_min: int, days_ago_max: int):
+              """Most recent entry whose date falls in [today-max, today-min] days ago."""
+              today = datetime.date.fromisoformat(TODAY)
+              candidates = []
+              for entry in history:
+                  try:
+                      d = datetime.date.fromisoformat(entry["date"])
+                  except (KeyError, ValueError):
+                      continue
+                  age = (today - d).days
+                  if days_ago_min <= age <= days_ago_max:
+                      candidates.append((age, entry))
+              if not candidates:
+                  return None
+              candidates.sort(key=lambda t: t[0])
+              return candidates[0][1]
+
+
+          def main() -> int:
+              data = fetch_companies()
+              companies = data.get("companies", [])
+
+              board_open = sum(c.get("open", 0) for c in companies)
+              board_described = sum(c.get("described", 0) for c in companies)
+              adj_open = sum(c.get("open", 0) for c in companies if c["company"] not in EXCLUDED)
+              adj_described = sum(c.get("described", 0) for c in companies if c["company"] not in EXCLUDED)
+              excluded_present = sorted(c["company"] for c in companies if c["company"] in EXCLUDED)
+
+              today_entry = {
+                  "date": TODAY,
+                  "board": {"open": board_open, "described": board_described, "pct": pct(board_described, board_open)},
+                  "adjusted": {
+                      "open": adj_open,
+                      "described": adj_described,
+                      "pct": pct(adj_described, adj_open),
+                      "excluded_count": len(excluded_present),
+                  },
+                  "companies": {
+                      c["company"]: {
+                          "open": c.get("open", 0),
+                          "described": c.get("described", 0),
+                          "pct": pct(c.get("described", 0), c.get("open", 0)),
+                      }
+                      for c in companies
+                  },
+              }
+
+              history = load_history()
+              prev_entry = history[-1] if history else None  # most recent prior run
+              baseline_entry = find_entry(history, days_ago_min=6, days_ago_max=9)  # ~week-old
+
+              problems = []
+
+              if baseline_entry is not None:
+                  base_pct = baseline_entry.get("adjusted", {}).get("pct")
+                  cur_pct = today_entry["adjusted"]["pct"]
+                  if base_pct is not None and cur_pct is not None and (base_pct - cur_pct) > BOARD_DROP_THRESHOLD:
+                      problems.append(
+                          f"Board adjusted coverage dropped {base_pct}% -> {cur_pct}% "
+                          f"({baseline_entry['date']} -> {TODAY}, a {round(base_pct - cur_pct, 1)}pt drop, "
+                          f"threshold {BOARD_DROP_THRESHOLD}pt)."
+                      )
+              else:
+                  problems.append("(no ~7-day-old history entry yet -- skipping week-over-week board check; recording baseline.)")
+
+              regressed = []
+              if prev_entry is not None:
+                  prev_companies = prev_entry.get("companies", {})
+                  for company, today_stats in today_entry["companies"].items():
+                      prev_stats = prev_companies.get(company)
+                      if not prev_stats or prev_stats.get("pct") is None or today_stats["pct"] is None:
+                          continue
+                      if prev_stats["pct"] >= COMPANY_FULL_THRESHOLD and today_stats["pct"] < COMPANY_REGRESSED_THRESHOLD:
+                          regressed.append((company, prev_stats["pct"], today_stats["pct"]))
+              if regressed:
+                  problems.append("Company regression(s) (was >=95% on the previous run, now <80%):")
+                  for company, prev_pct, cur_pct in sorted(regressed, key=lambda t: t[2]):
+                      problems.append(f"  {company}: {prev_pct}% -> {cur_pct}%")
+
+              print(f"Coverage check {TODAY}")
+              print(f"  Board:    {board_described}/{board_open} described = {today_entry['board']['pct']}%")
+              print(
+                  f"  Adjusted: {adj_described}/{adj_open} described = {today_entry['adjusted']['pct']}% "
+                  f"({len(excluded_present)} companies excluded: {', '.join(excluded_present) or 'none present'})"
+              )
+              if baseline_entry is not None:
+                  print(f"  7-day-ago baseline ({baseline_entry['date']}): {baseline_entry['adjusted']['pct']}% adjusted")
+
+              real_problems = [p for p in problems if not p.startswith("(")]
+              notes = [p for p in problems if p.startswith("(")]
+              if real_problems:
+                  print("\nREGRESSION DETECTED:")
+                  for p in real_problems:
+                      print(f"  {p}")
+              else:
+                  print("\nNo regression detected.")
+              for p in notes:
+                  print(f"  {p}")
+
+              history.append(today_entry)
+              history = [
+                  e for e in history
+                  if (datetime.date.fromisoformat(TODAY) - datetime.date.fromisoformat(e["date"])).days <= HISTORY_MAX_DAYS
+              ]
+              save_history(history)
+
+              return 1 if real_problems else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+          code=${PIPESTATUS[0]}
+          case "$code" in
+            0) status=clean ;;
+            1) status=regression ;;
+            *) status=infra_error ;;
+          esac
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # continue-on-error (set on this step) keeps the JOB going either
+          # way; the step's own outcome still goes red on 1 (regression) or
+          # 2 (infra error) -- same "non-zero = look at this run" visual as
+          # the Scrape workflow's link-check step. The steps below gate on
+          # the precise `status` output, not on outcome, so an infra error
+          # can never be mistaken for (or silently clear) a real regression.
+          exit "$code"
+
+      - name: Open GitHub Issue on coverage regression
+        if: steps.coverage-check.outputs.status == 'regression'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="$(cat /tmp/coverage_check.txt)"
+          DATE=$(date -u +"%Y-%m-%d")
+          EXISTING=$(gh issue list --repo morriswong/jtbf-scrape-runner --label coverage-regression --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo morriswong/jtbf-scrape-runner --body "**Re-checked $DATE — still regressed**
+          \`\`\`
+          $BODY
+          \`\`\`"
+          else
+            gh issue create \
+              --repo morriswong/jtbf-scrape-runner \
+              --title "📉 Description coverage regression detected ($DATE)" \
+              --label coverage-regression \
+              --body "The daily coverage check (issue #225) found a description-coverage regression: either board-wide adjusted coverage dropped >2pts week-over-week, or a company that was previously ≥95% described fell below 80%.
+
+          \`\`\`
+          $BODY
+          \`\`\`
+
+          _Auto-opened by the coverage-alert job. Auto-closes the next time the daily check passes clean._"
+          fi
+
+      - name: Close coverage-regression issue after a clean run
+        if: steps.coverage-check.outputs.status == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list --repo morriswong/jtbf-scrape-runner --label coverage-regression --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --repo morriswong/jtbf-scrape-runner --comment "Coverage check passed clean again. Auto-closing."
+          fi
+
+      # Persist today's board + per-company coverage so tomorrow's run (and
+      # next week's) has a baseline to compare against — same "commit small
+      # state, only from CI" pattern as data/index.json in scrape.yml.
+      - name: Commit coverage history
+        if: ${{ !cancelled() }}
+        run: |
+          if [ ! -f .github/coverage_history.json ]; then
+            echo "No coverage_history.json produced (coverage-check step likely failed before writing it) -- nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/coverage_history.json
+          git commit -m "chore: coverage history snapshot [skip ci]" || { echo "no change to commit"; exit 0; }
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push
