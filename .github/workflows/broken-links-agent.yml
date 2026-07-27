@@ -1,0 +1,167 @@
+name: Broken-links auto-fix agent
+
+# Follow-up to the "Open GitHub Issue on broken links" step in scrape.yml
+# (issue #183, deferred 2026-07-06 in favor of shipping the cheap WAF-filter
+# triage first — see docs/incidents or the jtbf-broken-links-auto-triage note).
+# When that step opens (or re-comments on) a `broken-links` issue on THIS
+# repo, spin up Claude to investigate the actual scraper code — which lives
+# in the PRIVATE morriswong/jtbf repo, not here — and, if it finds a genuine,
+# verifiable bug, open a DRAFT pull request against morriswong/jtbf. It never
+# merges anything itself: a human always reviews the PR. If it can't
+# confidently diagnose a real fix (site genuinely closed the roles, ATS
+# migration it can't safely verify, etc.) it just reports back on the issue
+# and leaves the code alone.
+#
+# Both triggers below fire only for OUR OWN check_links.py alerts, never for
+# arbitrary public activity on this public repo:
+#   - `issues: labeled` catches the first time a run opens a fresh
+#     broken-links issue.
+#   - `issue_comment: created` catches every later "Re-checked ... — still
+#     broken" comment scrape.yml appends to the SAME still-open issue (it
+#     reuses one issue rather than opening a new one per finding, so later
+#     discoveries only show up as comments, not new `labeled` events).
+# `allowed_bots` is the actual security boundary here, not the label/body
+# text match — those "Re-checked" comments are only ever posted by
+# `github-actions[bot]` via scrape.yml's own GITHUB_TOKEN, and by default
+# claude-code-action refuses to run for bot-authored triggers at all. Scoping
+# `allowed_bots` to exactly that one identity (not `*`) means a random public
+# GitHub account cannot forge a trigger for this workflow, even though the
+# repo is public and issues/comments are otherwise world-writable.
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write # to report back on the triggering issue in this repo
+
+concurrency:
+  # One investigation per issue at a time; a second alert on the same issue
+  # while one is already running queues rather than racing it.
+  group: broken-links-agent-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  investigate:
+    if: >
+      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'broken-links') ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, 'Re-checked') && contains(join(github.event.issue.labels.*.name, ','), 'broken-links'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # The scraper code this agent needs to read and fix lives in the
+      # PRIVATE morriswong/jtbf repo, not in this one. JTBF_PR_TOKEN is a
+      # fine-grained PAT scoped ONLY to morriswong/jtbf (Contents: write,
+      # Pull requests: write) — separate from JTBF_DEPLOY_KEY (SSH, used
+      # elsewhere in this repo only to push data/index.json state) because
+      # opening a PR needs GitHub API access an SSH deploy key can't provide.
+      - name: Checkout private pipeline repo (morriswong/jtbf)
+        uses: actions/checkout@v4
+        with:
+          repository: morriswong/jtbf
+          token: ${{ secrets.JTBF_PR_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure git identity for any fix commits
+        run: |
+          git config user.name "jtbf-broken-links-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Investigate and (maybe) fix
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "github-actions[bot]"
+          prompt: |
+            You are looking at a broken-link alert from morriswong/jtbf-scrape-runner
+            issue #${{ github.event.issue.number }}: "${{ github.event.issue.title }}"
+
+            Most recent finding (read this; it's the freshest data — the issue
+            body may describe an earlier, possibly already-fixed run):
+            ${{ github.event.comment.body || github.event.issue.body }}
+
+            This was produced by pipeline/check_links.py, which samples a company's
+            scraped job URLs and flags the company when >=60% of the sample errors
+            out (dead link, 404, or an error-page body even under a 200 status —
+            see the Goldman Sachs incident doc for why status-code-only checks
+            aren't trusted here). Known false-positive source: WAF/rate-limit
+            blocks (403/405/429, and Cloudflare/Eightfold challenge pages) are
+            already filtered out by check_links.py before an issue ever opens, so
+            treat what you see here as a real signal, not automatically a code bug
+            — plenty of "broken" links are just roles the company closed, which
+            isn't a bug at all.
+
+            You're working in a checkout of morriswong/jtbf (the repo the scraper
+            code actually lives in — this issue itself is filed on the separate
+            jtbf-scrape-runner repo that only orchestrates the cron).
+
+            Do this:
+            1. For each affected company slug named above, read
+               scrapers/{slug}/scraper.py and scrapers/{slug}/README.md.
+            2. Independently check a couple of the broken URLs yourself (curl or
+               fetch them) to see what's actually happening: redirected, 404, a
+               genuine "this role is no longer available" page, or a URL the
+               scraper itself constructed wrong (stale ID field, wrong base host,
+               off-by-one in a path template, etc).
+            3. Decide: (a) it's a genuine, fixable scraper bug — fix it, then
+               verify by running `python scrapers/{slug}/scraper.py` and
+               confirming it now emits URLs that actually resolve; or (b) it
+               isn't a code bug (roles genuinely closed, an ATS migration you
+               can't safely verify from here, anything you're not confident
+               about) — leave the code alone.
+            4. Before opening anything, check for an existing open PR against
+               morriswong/jtbf whose branch starts with `fix/broken-links-` and
+               already covers this company — if one exists, don't duplicate it;
+               just note that in your summary.
+            5. If (a) and no duplicate exists: commit on a new branch named
+               `fix/broken-links-{slug}-{short description}`, push it, and open a
+               DRAFT pull request against morriswong/jtbf explaining the root
+               cause, the fix, and exactly how you verified it
+               (`gh pr create --draft --repo morriswong/jtbf ...`). Never merge
+               it yourself — a human always reviews and merges.
+            6. Finish by producing the structured output below.
+          claude_args: |
+            --max-turns 40
+            --allowedTools "Bash,Read,Edit,Write,Grep,Glob"
+            --json-schema '{"type":"object","properties":{"fixed":{"type":"boolean"},"pr_url":{"type":"string"},"summary":{"type":"string"}},"required":["fixed","summary"]}'
+        env:
+          # Only this step gets write access to the private repo — scoped to
+          # exactly the git push + `gh pr create --repo morriswong/jtbf` calls
+          # Claude makes via its Bash tool. The later report-back step
+          # deliberately uses the default GITHUB_TOKEN instead (scoped to
+          # THIS repo, jtbf-scrape-runner) since it's commenting here, not
+          # touching jtbf.
+          GH_TOKEN: ${{ secrets.JTBF_PR_TOKEN }}
+
+      - name: Report back on the triggering issue
+        if: always() && steps.claude.outputs.structured_output != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUTPUT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          FIXED=$(echo "$OUTPUT" | jq -r '.fixed // false')
+          SUMMARY=$(echo "$OUTPUT" | jq -r '.summary // "No summary returned."')
+          PR_URL=$(echo "$OUTPUT" | jq -r '.pr_url // empty')
+          if [ "$FIXED" = "true" ] && [ -n "$PR_URL" ]; then
+            BODY="🤖 Investigated and opened a draft PR: $PR_URL
+
+          $SUMMARY
+
+          This does not auto-merge — review and merge it yourself when ready."
+          else
+            BODY="🤖 Investigated, did not open a fix.
+
+          $SUMMARY"
+          fi
+          gh issue comment ${{ github.event.issue.number }} --repo morriswong/jtbf-scrape-runner --body "$BODY"
