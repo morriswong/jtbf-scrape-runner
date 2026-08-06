@@ -64,6 +64,15 @@ on:
     - cron: "45 5 */3 * *"
   workflow_dispatch: {}
 
+# Serialize against description-delta.yml (same `worker-heavy` group): both
+# workflows read every company's full R2 content blob through the Worker, and
+# running them concurrently amplified 503s when they overlapped on
+# 2026-08-01. A new run waits for the in-flight one instead of cancelling it,
+# same pattern as scrape.yml's `scrape` group.
+concurrency:
+  group: worker-heavy
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
