@@ -95,6 +95,9 @@ permissions:
 jobs:
   description-delta:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # commit data/delta_state.json (attempt-tracking/parking state, #223)
+      issues: write    # open/comment/close the per-company delta-failure triage issues
     # #238 raised this to 45 as a STOPGAP when #237 put the 8 biggest boards in
     # scope (listing all 8 alone measured 6m08s). #223 day-batches those 8 into
     # two halves of ~4 (see SEAM_DAY_BATCH in daily_delta.py) so only half their
@@ -137,6 +140,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Exit-code semantics (see classify_run() in pipeline/daily_delta.py): this
+      # step no longer goes red for a couple of independent boards having a bad
+      # night -- those are reported as triage issues by the step further down and
+      # the run stays green, because a run that described hundreds of jobs while
+      # one Workday tenant 401'd did its job. It DOES still fail on either
+      # systemic signal: more companies down at once than TOLERATED_FAILED_COMPANIES,
+      # or any push/config failure (descriptions fetched but never stored).
       - name: Detail-fetch new jobs and push descriptions
         env:
           # Shared write key — Settings > Secrets and variables > Actions.
@@ -167,7 +177,7 @@ jobs:
           fi
 
           echo "Running daily_delta.py $MODE$CAPS ${COMPANIES:-<all gated>}"
-          python pipeline/daily_delta.py $MODE $CAPS $COMPANIES
+          python pipeline/daily_delta.py $MODE $CAPS --failure-report=/tmp/delta_failures.json $COMPANIES
 
       # Persist attempt-tracking/parking state (#223): data/delta_state.json
       # records per-job failure streaks so a structurally-unobtainable job
@@ -189,6 +199,35 @@ jobs:
           git commit -m "chore: description-delta attempt state [skip ci]" || { echo "no change to commit"; exit 0; }
           git pull --rebase origin "${GITHUB_REF_NAME}" || true
           git push
+
+      # Turn this run's failure report into ONE GitHub Issue PER FAILING COMPANY
+      # -- opened on first failure, commented on each run it keeps failing,
+      # auto-closed the first run that company succeeds. Before this, a failure
+      # was a single log line ("1 compan(y/ies) FAILED this run: circle") with the
+      # cause printed hundreds of lines earlier and never surfaced anywhere, so
+      # the only signal was a red X nobody could act on days later.
+      #
+      # Runs even when the step above FAILED (!cancelled()): a systemic failure is
+      # exactly when these issues matter most. If that step died before writing
+      # the report, delta_triage.py says so and exits 0.
+      #
+      # continue-on-error: a GitHub API hiccup must not turn an otherwise-good
+      # drain red. The step's own outcome still shows the failure in the run.
+      #
+      # --repo is github.repository ON PURPOSE, not a hardcoded slug: the default
+      # GITHUB_TOKEN can only write issues in the repo it runs in, so issues land
+      # here (jtbf-scrape-runner) for the nightly cron and in jtbf for a manual
+      # dispatch there -- which also keeps this step byte-identical in both repos'
+      # copies of this file (see the repo-split note at the top). The script
+      # itself lives in the private jtbf repo checked out above, so there is only
+      # one copy of the logic.
+      - name: Open triage issues for failed companies
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python pipeline/delta_triage.py /tmp/delta_failures.json --repo "${{ github.repository }}"
 
   # Issue #225 (WS-6): coverage as a queryable metric + regression alert.
   # Independent of the delta job above -- it only READS the public /companies
