@@ -98,11 +98,24 @@ jobs:
                 ARGS="all"
               else
                 # Separate budgets so a backlog of failures can't starve the
-                # staleness refresh (and vice-versa): retry up to 10 failures
-                # and refresh up to 15 stalest. The final resolve below
-                # de-dupes and validates the union (<=25 companies).
-                FAILED="$(python pipeline/select_targets.py failed --cap 10)"
-                STALE="$(python pipeline/select_targets.py stale --cap 15)"
+                # staleness refresh (and vice-versa): retry up to 6 failures
+                # and refresh up to 9 stalest. The final resolve below
+                # de-dupes and validates the union (<=15 companies).
+                #
+                # TEMPORARY BRAKE (2026-09-10). Was 10 + 15 = 25/run, which
+                # measured ~98k D1 rows_written/day against a 100k/day free
+                # cap and blew it on 2026-09-09. The floor is structural:
+                # D1 bills 1 row_written for an INSERT..ON CONFLICT even when
+                # the DO UPDATE's WHERE correctly skips the write, so merely
+                # ASKING "did this job change?" costs a write, and re-verifying
+                # ~61k jobs/day costs ~61k writes however good the SQL is.
+                # 15/run trades refresh latency (~every 4-5 days per company
+                # instead of ~3) for staying under the cap. REMOVE THIS BRAKE
+                # once push_to_api.py diffs client-side and stops sending
+                # unchanged jobs to D1 at all -- then cost tracks churn, not
+                # corpus size, and the cap stops binding.
+                FAILED="$(python pipeline/select_targets.py failed --cap 6)"
+                STALE="$(python pipeline/select_targets.py stale --cap 9)"
                 ARGS="$FAILED $STALE"
               fi
               ;;
