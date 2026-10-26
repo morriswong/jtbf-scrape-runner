@@ -1,0 +1,70 @@
+name: API health watch
+
+# External check for the JTBF API, which reads/writes a SQLite DB on the
+# Hetzner box (web-server-1) through Cloudflare Tunnel. Runs OFF the box on
+# purpose: if the box or the tunnel dies, nothing on the box can report it.
+# /health says db_backend "remote" when healthy; "d1-fallback" means the Worker
+# could not reach the box and is serving stale-but-up data from D1. Anything
+# other than "remote" (or no answer) opens/updates one issue -> GitHub emails
+# the owner; a healthy check closes it. Public repo => Actions minutes are free.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+
+concurrency:
+  group: api-health
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check /health (3 tries)
+        id: health
+        run: |
+          set -u
+          state=down; body=""
+          for i in 1 2 3; do
+            body=$(curl -s -m 20 https://jtbf-jobs-api.morriswch.workers.dev/health || true)
+            backend=$(printf '%s' "$body" | python3 -c 'import sys,json
+          try: print(json.load(sys.stdin).get("db_backend",""))
+          except Exception: print("")')
+            if [ "$backend" = "remote" ]; then state=ok; break; fi
+            state="${backend:-down}"; sleep 20
+          done
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          { echo 'body<<EOF'; printf '%s\n' "${body:0:2000}"; echo EOF; } >> "$GITHUB_OUTPUT"
+          echo "state=$state"
+
+      - name: Open or update the alert issue
+        if: steps.health.outputs.state != 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          STATE: ${{ steps.health.outputs.state }}
+          BODY: ${{ steps.health.outputs.body }}
+        run: |
+          gh label create api-down --color B60205 --description "JTBF API not on the Hetzner DB" 2>/dev/null || true
+          msg="**$(date -u +'%Y-%m-%d %H:%M UTC')**: \`/health\` → \`$STATE\` (expected \`remote\`).
+
+          \`\`\`
+          $BODY
+          \`\`\`
+          \`d1-fallback\`: site up on stale D1 data, box or tunnel unreachable (check \`systemctl status cloudflared jtbf-db\` on web-server-1). \`down\`: the Worker itself is failing."
+          n=$(gh issue list --label api-down --state open --json number --jq '.[0].number')
+          if [ -n "$n" ]; then gh issue comment "$n" --body "$msg"; else gh issue create --label api-down --title "JTBF API is not on the Hetzner DB ($STATE)" --body "$msg"; fi
+
+      - name: Close the alert issue when healthy
+        if: steps.health.outputs.state == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for n in $(gh issue list --label api-down --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Recovered: \`/health\` reports \`remote\` again ($(date -u +'%Y-%m-%d %H:%M UTC'))."
+          done
